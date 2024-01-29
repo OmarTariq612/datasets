@@ -11,6 +11,7 @@ from ..download.download_config import DownloadConfig
 from ..download.streaming_download_manager import xopen, xsplitext
 from ..table import array_cast
 from ..utils.py_utils import no_op_if_value_is_null, string_to_dict
+from ..utils.file_utils import is_local_path
 
 
 if TYPE_CHECKING:
@@ -70,6 +71,7 @@ class Audio:
     dtype: ClassVar[str] = "dict"
     pa_type: ClassVar[Any] = pa.struct({"bytes": pa.binary(), "path": pa.string()})
     _type: str = field(default="Audio", init=False, repr=False)
+    backend: str = "sox_io"
 
     def __call__(self):
         return self.pa_type
@@ -84,10 +86,19 @@ class Audio:
         Returns:
             `dict`
         """
+
+        # try:
+        #     import soundfile as sf  # soundfile is a dependency of librosa, needed to decode audio files.
+        # except ImportError as err:
+        #     raise ImportError("To support encoding audio data, please install 'soundfile'.") from err
+
         try:
-            import soundfile as sf  # soundfile is a dependency of librosa, needed to decode audio files.
+            import torch
+            import torchaudio
+            torchaudio.set_audio_backend(self.backend)
         except ImportError as err:
-            raise ImportError("To support encoding audio data, please install 'soundfile'.") from err
+            raise ImportError("To support encoding audio data, please install 'torchaudio'.") from err
+
         if isinstance(value, str):
             return {"bytes": None, "path": value}
         elif isinstance(value, bytes):
@@ -95,7 +106,7 @@ class Audio:
         elif "array" in value:
             # convert the audio array to wav bytes
             buffer = BytesIO()
-            sf.write(buffer, value["array"], value["sampling_rate"], format="wav")
+            torchaudio.save(buffer, torch.tensor(value["array"]), value["sampling_rate"], format="wav")
             return {"bytes": buffer.getvalue(), "path": None}
         elif value.get("path") is not None and os.path.isfile(value["path"]):
             # we set "bytes": None to not duplicate the data if they're already available locally
@@ -111,7 +122,7 @@ class Audio:
                     bytes_value = np.memmap(value["path"], dtype="h", mode="r").astype(np.float32) / 32767
 
                 buffer = BytesIO(bytes())
-                sf.write(buffer, bytes_value, value["sampling_rate"], format="wav")
+                torchaudio.save(buffer, bytes_value, value["sampling_rate"], format="wav")
                 return {"bytes": buffer.getvalue(), "path": None}
             else:
                 return {"bytes": None, "path": value.get("path")}
@@ -150,50 +161,44 @@ class Audio:
             raise ValueError(f"An audio sample should have one of 'path' or 'bytes' but both are None in {value}.")
 
         try:
-            import librosa
-            import soundfile as sf
+            import torchaudio
+            torchaudio.set_audio_backend(self.backend)
         except ImportError as err:
-            raise ImportError("To support decoding audio files, please install 'librosa' and 'soundfile'.") from err
+            raise ImportError(f"To support decoding audio files, please install 'torchaudio' and '{self.backend}'.") from err
 
         audio_format = xsplitext(path)[1][1:].lower() if path is not None else None
-        if not config.IS_OPUS_SUPPORTED and audio_format == "opus":
-            raise RuntimeError(
-                "Decoding 'opus' files requires system library 'libsndfile'>=1.0.31, "
-                'You can try to update `soundfile` python library: `pip install "soundfile>=0.12.1"`. '
-            )
-        elif not config.IS_MP3_SUPPORTED and audio_format == "mp3":
-            raise RuntimeError(
-                "Decoding 'mp3' files requires system library 'libsndfile'>=1.1.0, "
-                'You can try to update `soundfile` python library: `pip install "soundfile>=0.12.1"`. '
-            )
 
         if file is None:
-            token_per_repo_id = token_per_repo_id or {}
-            source_url = path.split("::")[-1]
-            pattern = (
-                config.HUB_DATASETS_URL if source_url.startswith(config.HF_ENDPOINT) else config.HUB_DATASETS_HFFS_URL
-            )
-            try:
-                repo_id = string_to_dict(source_url, pattern)["repo_id"]
-                token = token_per_repo_id[repo_id]
-            except (ValueError, KeyError):
-                token = None
+            # token_per_repo_id = token_per_repo_id or {}
+            # source_url = path.split("::")[-1]
+            # pattern = (
+            #     config.HUB_DATASETS_URL if source_url.startswith(config.HF_ENDPOINT) else config.HUB_DATASETS_HFFS_URL
+            # )
+            # try:
+            #     repo_id = string_to_dict(source_url, pattern)["repo_id"]
+            #     token = token_per_repo_id[repo_id]
+            # except (ValueError, KeyError):
+            #     token = None
 
-            download_config = DownloadConfig(token=token)
-            with xopen(path, "rb", download_config=download_config) as f:
-                array, sampling_rate = sf.read(f)
+            # download_config = DownloadConfig(token=token)
+            # with xopen(path, "rb", download_config=download_config) as f:
+            #     array, sampling_rate = torchaudio.load(f, format=audio_format)
+            if is_local_path(path) is False:
+                raise ValueError("path must be a local path (for now).")
+            array, sampling_rate = torchaudio.load(path)
 
         else:
-            array, sampling_rate = sf.read(file)
+            array, sampling_rate = torchaudio.load(file, format=audio_format)
 
-        array = array.T
+        # array = array.T
         if self.mono:
-            array = librosa.to_mono(array)
+            array = array[0].flatten()
         if self.sampling_rate and self.sampling_rate != sampling_rate:
-            array = librosa.resample(array, orig_sr=sampling_rate, target_sr=self.sampling_rate)
+            import torchaudio.transforms as at
+            array = at.Resample(sampling_rate, self.sampling_rate)(array)
             sampling_rate = self.sampling_rate
 
-        return {"path": path, "array": array, "sampling_rate": sampling_rate}
+        return {"path": path, "array": array.numpy(), "sampling_rate": sampling_rate}
 
     def flatten(self) -> Union["FeatureType", Dict[str, "FeatureType"]]:
         """If in the decodable state, raise an error, otherwise flatten the feature into a dictionary."""
